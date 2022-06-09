@@ -20,6 +20,11 @@ describe LogStash::Inputs::Http do
   let(:client_options) { { } }
   let(:logstash_queue) { Queue.new }
   let(:port) { rand(5000) + 1025 }
+  let(:url) { "http://127.0.0.1:#{port}" }
+
+  let(:config) { { "port" => port } }
+
+  subject { described_class.new(config) }
 
   it_behaves_like "an interruptible input plugin" do
     let(:config) { { "port" => port } }
@@ -32,7 +37,6 @@ describe LogStash::Inputs::Http do
   end
 
   describe "request handling" do
-    subject { LogStash::Inputs::Http.new("port" => port) }
 
     before :each do
       setup_server_client
@@ -49,7 +53,7 @@ describe LogStash::Inputs::Http do
         "socket_timeout" => 0.1
       } }
 
-      subject { described_class.new("port" => port, "threads" => threads, "max_pending_requests" => max_pending_requests) }
+      let(:config) { { "port" => port, "threads" => threads, "max_pending_requests" => max_pending_requests } }
 
       context "when sending more requests than queue slots" do
         it "should block when the queue is full" do
@@ -74,7 +78,7 @@ describe LogStash::Inputs::Http do
     end
 
     context "with default codec" do
-      subject { LogStash::Inputs::Http.new("port" => port) }
+
       context "when receiving a text/plain request" do
         it "should process the request normally" do
           client.post("http://127.0.0.1:#{port}/meh.json",
@@ -84,6 +88,7 @@ describe LogStash::Inputs::Http do
           expect(event.get("message")).to eq("hello")
         end
       end
+
       context "when receiving a deflate compressed text/plain request" do
         it "should process the request normally" do
           client.post("http://127.0.0.1:#{port}/meh.json",
@@ -93,16 +98,18 @@ describe LogStash::Inputs::Http do
           expect(event.get("message")).to eq("hello")
         end
       end
+
       context "when receiving a deflate text/plain request that cannot be decompressed" do
         let(:response) do
-          response = client.post("http://127.0.0.1:#{port}/meh.json",
-                                 :headers => { "content-type" => "text/plain", "content-encoding" => "deflate" },
-                                   :body => "hello").call
+          client.post("http://127.0.0.1:#{port}/meh.json",
+                      :headers => { "content-type" => "text/plain", "content-encoding" => "deflate" },
+                      :body => "hello").call
         end
         it "should respond with 400" do
           expect(response.code).to eq(400)
         end
       end
+
       context "when receiving a gzip compressed text/plain request" do
         it "should process the request normally" do
           wio = StringIO.new("w")
@@ -118,6 +125,7 @@ describe LogStash::Inputs::Http do
           expect(event.get("message")).to eq("hello")
         end
       end
+
       context "when receiving a gzip text/plain request that cannot be decompressed" do
         let(:response) do
           client.post("http://127.0.0.1:#{port}",
@@ -128,6 +136,7 @@ describe LogStash::Inputs::Http do
           expect(response.code).to eq(400)
         end
       end
+
       context "when receiving an application/json request" do
         it "should parse the json body" do
           client.post("http://127.0.0.1:#{port}/meh.json",
@@ -140,16 +149,108 @@ describe LogStash::Inputs::Http do
     end
 
     context "with json codec" do
-      subject { LogStash::Inputs::Http.new("port" => port, "codec" => "json") }
+      let(:config) { super().merge("codec" => "json") }
+      let(:url) { "http://127.0.0.1:#{port}/meh.json" }
+      let(:response) do
+        client.post(url, :body => { "message" => "Hello" }.to_json).call
+      end
+
       it "should parse the json body" do
-        response = client.post("http://127.0.0.1:#{port}/meh.json", :body => { "message" => "Hello" }.to_json).call
+        expect(response.code).to eq(200)
         event = logstash_queue.pop
         expect(event.get("message")).to eq("Hello")
       end
+
+      context 'with ssl' do
+
+        let(:url) { super().sub('http://', 'https://') }
+
+        certs_dir = File.expand_path('../fixtures/certs/generated', File.dirname(__FILE__))
+
+        let(:config) do
+          super().merge 'ssl' => true,
+                        'ssl_certificate_authorities' => [ File.join(certs_dir, 'root.crt') ],
+                        'ssl_certificate' => File.join(certs_dir, 'server_from_root.crt'),
+                        'ssl_key' => File.join(certs_dir, 'server_from_root.key.pkcs8'),
+                        'ssl_verify_mode' => 'peer'
+        end
+
+        let(:client_options) do
+          super().merge ssl: {
+              verify: false,
+              ca_file: File.join(certs_dir, 'root.crt'),
+              client_cert: File.join(certs_dir, 'client_from_root.crt'),
+              client_key: File.join(certs_dir, 'client_from_root.key.pkcs8'),
+          }
+        end
+
+        it "should parse the json body" do
+          # [DEBUG][io.netty.handler.ssl.SslHandler] [id: 0xcaf869ff, L:/127.0.0.1:5610 - R:/127.0.0.1:32890] HANDSHAKEN: protocol:TLSv1.2 cipher suite:TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+          # [DEBUG][org.apache.http.conn.ssl.SSLConnectionSocketFactory] Secure session established
+          # [DEBUG][org.apache.http.conn.ssl.SSLConnectionSocketFactory]  negotiated protocol: TLSv1.2
+          # [DEBUG][org.apache.http.conn.ssl.SSLConnectionSocketFactory]  negotiated cipher suite: TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384
+          expect(response.code).to eq(200)
+          event = logstash_queue.pop
+          expect(event.get("message")).to eq("Hello")
+        end
+
+        TLS13_ENABLED_BY_DEFAULT = begin
+                                     context = javax.net.ssl.SSLContext.getInstance('TLS')
+                                     context.init nil, nil, nil
+                                     context.getDefaultSSLParameters.getProtocols.include? 'TLSv1.3'
+                                   rescue => e
+                                     warn "failed to detect TLSv1.3 support: #{e.inspect}"
+                                     nil
+                                   end
+
+        context 'with TLSv1.3 client' do
+
+          let(:client_options) do
+            super().tap do |opts|
+              opts.fetch(:ssl).merge! protocols: ['TLSv1.3']
+            end
+          end
+
+          it "should parse the json body" do
+            expect(response.code).to eq(200)
+            event = logstash_queue.pop
+            expect(event.get("message")).to eq("Hello")
+          end
+
+          context 'enforced TLSv1.3 in plugin' do
+
+            let(:config) { super().merge 'ssl_supported_protocols' => ['TLSv1.3'],
+                                         'ssl_cipher_suites' => [ 'TLS_AES_128_GCM_SHA256' ] }
+
+            it "should parse the json body" do
+              expect(response.code).to eq(200)
+              event = logstash_queue.pop
+              expect(event.get("message")).to eq("Hello")
+            end
+
+          end
+
+          context 'enforced TLSv1.3 (deprecated options)' do
+
+            let(:config) { super().merge 'tls_min_version' => 1.3,
+                                         'cipher_suites' => [ 'TLS_AES_128_GCM_SHA256' ] }
+
+            it "should parse the json body" do
+              expect(response.code).to eq(200)
+              event = logstash_queue.pop
+              expect(event.get("message")).to eq("Hello")
+            end
+
+          end
+
+        end if TLS13_ENABLED_BY_DEFAULT
+
+      end
+
     end
 
     context "with json_lines codec without final delimiter" do
-      subject { LogStash::Inputs::Http.new("port" => port, "codec" => "json_lines") }
+      let(:config) { super().merge("codec" => "json_lines") }
       let(:line1) { '{"foo": 1}' }
       let(:line2) { '{"foo": 2}' }
       it "should parse all json_lines in body including last one" do
@@ -169,7 +270,7 @@ describe LogStash::Inputs::Http do
         body = { "message" => "Hello" }.to_json
         client.post("http://127.0.0.1:#{port}/meh.json",
                     :headers => { "content-type" => "application/json" },
-                      :body => body).call
+                    :body => body).call
         event = logstash_queue.pop
         expect(event.get("message")).to eq(body)
       end
@@ -388,15 +489,18 @@ describe LogStash::Inputs::Http do
   end
 
   # wait until server is ready
-  def setup_server_client
+  def setup_server_client(url = self.url)
     subject.register
-    t = Thread.new { subject.run(logstash_queue) }
+    t = Thread.start { subject.run(logstash_queue) }
     ok = false
     until ok
       begin
-        client.post("http://127.0.0.1:#{port}", :body => '{}').call
-      rescue => e
-        # retry
+        client.post(url, :body => '{}').call
+      rescue Manticore::SocketException => e
+        puts "retry client.post due #{e}" if $VERBOSE
+      rescue Manticore::ManticoreException => e
+        warn e.inspect
+        raise e.cause ? e.cause : e
       else
         ok = true
       end
@@ -445,6 +549,12 @@ describe LogStash::Inputs::Http do
       subject { LogStash::Inputs::Http.new("port" => port, "ssl" => true) }
       it "should raise exception" do
         expect { subject.register }.to raise_exception(LogStash::ConfigurationError)
+      end
+    end
+    context "with invalid cipher suites" do
+      it "should raise a configuration error" do
+        invalid_config = config.merge("ssl_cipher_suites" => "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA38")
+        expect { LogStash::Inputs::Http.new(invalid_config) }.to raise_error(LogStash::ConfigurationError)
       end
     end
     context "with :ssl_certificate" do
@@ -505,18 +615,6 @@ describe LogStash::Inputs::Http do
         end
       end
 
-      context "with invalid cipher_suites" do
-        let(:config) { super().merge("cipher_suites" => "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA38") }
-
-        it "should raise a configuration error" do
-          expect( subject.logger ).to receive(:error) do |msg, opts|
-            expect( msg ).to match /.*?configuration invalid/
-            expect( opts[:message] ).to match /TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA38.*? not available/
-          end
-          expect { subject.register }.to raise_error(LogStash::ConfigurationError)
-        end
-      end
-
       context "with invalid ssl certificate" do
         before do
           cert = File.readlines path = config["ssl_certificate"]
@@ -548,8 +646,7 @@ describe LogStash::Inputs::Http do
 
       context "with invalid ssl certificate_authorities" do
         let(:config) do
-          super().merge("ssl_verify_mode" => "peer",
-                      "ssl_certificate_authorities" => [ ssc.certificate.path, ssc.private_key.path ])
+          super().merge("ssl_verify_mode" => "peer", "ssl_certificate_authorities" => [ ssc.certificate.path, ssc.private_key.path ])
         end
 
         it "should raise a cert error" do
@@ -565,6 +662,123 @@ describe LogStash::Inputs::Http do
         end
       end
 
+      context "with both verify_mode options set" do
+        let(:config) do
+          super().merge('ssl_verify_mode' => 'peer', 'verify_mode' => 'none')
+        end
+
+        it "should raise a configuration error" do
+          expect { subject.register }.to raise_error LogStash::ConfigurationError, /Use only .?ssl_verify_mode.?/i
+        end
+      end
+
+      context "with ssl_cipher_suites and cipher_suites set" do
+        let(:config) do
+          super().merge('ssl_cipher_suites' => ['TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384'],
+                        'cipher_suites' => ['TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384'])
+        end
+
+        it "should raise a configuration error" do
+          expect { subject.register }.to raise_error LogStash::ConfigurationError, /Use only .?ssl_cipher_suites.?/i
+        end
+      end
+
+      context "with ssl_supported_protocols and tls_min_version set" do
+        let(:config) do
+          super().merge('ssl_supported_protocols' => ['TLSv1.2'], 'tls_min_version' => 1.0)
+        end
+
+        it "should raise a configuration error" do
+          expect { subject.register }.to raise_error LogStash::ConfigurationError, /Use only .?ssl_supported_protocols.?/i
+        end
+      end
+
+      context "with ssl_supported_protocols and tls_max_version set" do
+        let(:config) do
+          super().merge('ssl_supported_protocols' => ['TLSv1.2'], 'tls_max_version' => 1.2)
+        end
+
+        it "should raise a configuration error" do
+          expect { subject.register }.to raise_error LogStash::ConfigurationError, /Use only .?ssl_supported_protocols.?/i
+        end
+      end
+
+    end
+  end
+end
+
+# If we have a setting called `pipeline.ecs_compatibility`, we need to
+# ensure that our additional_codecs are instantiated with the proper
+# execution context in order to ensure that the pipeline setting is
+# respected.
+if LogStash::SETTINGS.registered?('pipeline.ecs_compatibility')
+
+  def setting_value_supported?(name, value)
+    setting = ::LogStash::SETTINGS.clone.get_setting(name)
+    setting.set(value)
+    setting.validate_value
+    true
+  rescue
+    false
+  end
+
+  describe LogStash::Inputs::Http do
+    context 'additional_codecs' do
+      let(:port) { rand(1025...5000) }
+
+      %w(disabled v1 v8).each do |spec|
+        if setting_value_supported?('pipeline.ecs_compatibility', spec)
+          context "with `pipeline.ecs_compatibility: #{spec}`" do
+            # Override DevUtils's `new_pipeline` default to inject pipeline settings that
+            # are different than our global settings, so that we can validate the condition
+            # where pipeline settings override global settings.
+            def new_pipeline(config_parts, pipeline_id = :main, settings = pipeline_settings)
+              super(config_parts, pipeline_id, settings)
+            end
+
+            let(:pipeline_settings) do
+              ::LogStash::SETTINGS.clone.tap do |s|
+                s.set('pipeline.ecs_compatibility', spec)
+              end
+            end
+
+            it 'propagates the ecs_compatibility pipeline setting to the additional_codecs' do
+              # Ensure plugins pick up pipeline-level setting over the global default.
+              aggregate_failures('precondition') do
+                expect(::LogStash::SETTINGS).to_not be_set('pipeline.ecs_compatibility')
+                expect(pipeline_settings).to be_set('pipeline.ecs_compatibility')
+              end
+
+              input("input { http { port => #{port} additional_codecs => { 'application/json' => 'json' 'text/plain' => 'plain' } } }") do |pipeline, queue|
+                http_input = pipeline.inputs.first
+                aggregate_failures('initialization precondition') do
+                  expect(http_input).to be_a_kind_of(described_class)
+                  expect(http_input.execution_context&.pipeline&.settings&.to_hash).to eq(pipeline_settings.to_hash)
+                end
+
+                http_input.codecs.each do |key, value|
+                  aggregate_failures("Codec for `#{key}`") do
+                    expect(value.ecs_compatibility).to eq(spec.to_sym)
+                  end
+                end
+              end
+            end
+          end
+        end
+      end
+
+      it 'propagates the execution context from the input to the codecs' do
+        input("input { http { port => #{port} } }") do |pipeline, queue|
+          http_input = pipeline.inputs.first
+          expect(http_input).to be_a_kind_of(described_class) # precondition
+
+          http_input.codecs.each do |key, value|
+            aggregate_failures("Codec for `#{key}`") do
+              expect(value.execution_context).to be http_input.execution_context
+            end
+          end
+        end
+      end
     end
   end
 end
